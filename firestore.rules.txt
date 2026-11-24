@@ -1,0 +1,110 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    // Only YOUR verified Google account is the owner. Checked on Google's servers, cannot be faked.
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email == 'gokoivot@gmail.com'
+        && request.auth.token.email_verified == true;
+    }
+    // Current month in Bangladesh time (UTC+6), e.g. "2026-11"
+    function monthNow() {
+      let t = request.time + duration.value(6, 'h');
+      return string(t.year()) + '-' + (t.month() < 10 ? '0' : '') + string(t.month());
+    }
+    function elapsed(oldTs) { return (request.time.toMillis() - oldTs.toMillis()) / 1000; }
+    function isDisabled(uid) {
+      return get(/databases/$(database)/documents/players/$(uid)).data.disabled == true;
+    }
+
+    // ---------- players: each player only reads/writes THEIR OWN document ----------
+    match /players/{uid} {
+      allow get: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow list: if isAdmin();
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name','nameLower','createdAt','lastActive','lastSync','totalSec','monthKey','monthSec','games','sessions','matches','wins','disabled'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 16
+        && request.resource.data.totalSec == 0 && request.resource.data.monthSec == 0
+        && request.resource.data.sessions == 0 && request.resource.data.wins == 0
+        && request.resource.data.disabled == false
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.lastSync == request.time
+        && request.resource.data.monthKey == monthNow();
+      allow update: if
+        (isAdmin() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['disabled','name','nameLower','kick']))
+        || (signedIn() && request.auth.uid == uid && resource.data.disabled == false && playerOk());
+      allow delete: if false;
+    }
+    // Server-side playtime validation: a player can never claim more seconds than real time passed.
+    function playerOk() {
+      let n = request.resource.data;
+      let o = resource.data;
+      let dt = elapsed(o.lastSync);
+      return n.diff(o).affectedKeys().hasOnly(['name','nameLower','lastActive','lastSync','totalSec','monthKey','monthSec','games','sessions','matches','wins'])
+        && n.name is string && n.name.size() >= 1 && n.name.size() <= 16
+        && n.lastSync == request.time && n.lastActive == request.time
+        && n.totalSec >= o.totalSec && n.totalSec - o.totalSec <= dt + 5
+        && (n.monthKey == o.monthKey || n.monthKey == monthNow())
+        && (n.monthKey == o.monthKey
+              ? (n.monthSec >= o.monthSec && n.monthSec - o.monthSec <= dt + 5)
+              : n.monthSec <= dt + 5)
+        && n.sessions >= o.sessions && n.sessions - o.sessions <= 10
+        && n.wins >= o.wins && n.wins - o.wins <= 10
+        && n.matches >= o.matches && n.matches - o.matches <= 10;
+    }
+
+    // ---------- monthly playtime. Public may only read the TOP 1 (never a list of players) ----------
+    match /months/{m}/players/{uid} {
+      allow get: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow list: if isAdmin() || (signedIn() && request.query.limit <= 1);
+      allow create: if signedIn() && request.auth.uid == uid && m == monthNow() && !isDisabled(uid)
+        && request.resource.data.keys().hasOnly(['name','sec','updated'])
+        && request.resource.data.name is string && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 16
+        && request.resource.data.sec is number && request.resource.data.sec >= 0 && request.resource.data.sec <= 120
+        && request.resource.data.updated == request.time;
+      allow update: if signedIn() && request.auth.uid == uid && m == monthNow() && !isDisabled(uid)
+        && request.resource.data.keys().hasOnly(['name','sec','updated'])
+        && request.resource.data.name is string && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 16
+        && request.resource.data.sec >= resource.data.sec
+        && request.resource.data.sec - resource.data.sec <= elapsed(resource.data.updated) + 5
+        && request.resource.data.updated == request.time;
+      allow delete: if false;
+    }
+
+    // ---------- public site settings: everyone reads, ONLY the owner writes ----------
+    match /config/public {
+      allow read: if true;
+      allow write: if isAdmin()
+        && request.resource.data.keys().hasOnly(['master','games','visitMode','visitValue','potmOverride','motm','banner']);
+    }
+
+    // ---------- real visit counter (owner reads; players can only add +1, max once per 6 hours) ----------
+    match /stats/global {
+      allow read: if isAdmin();
+      allow create: if isAdmin();
+      allow update: if isAdmin()
+        || (signedIn()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['visits'])
+            && request.resource.data.visits == resource.data.visits + 1
+            && getAfter(/databases/$(database)/documents/visitors/$(request.auth.uid)).data.last == request.time);
+    }
+    match /visitors/{uid} {
+      allow read: if isAdmin();
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['last']) && request.resource.data.last == request.time;
+      allow update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['last']) && request.resource.data.last == request.time
+        && request.time > resource.data.last + duration.value(6, 'h');
+    }
+
+    // ---------- owner activity log ----------
+    match /adminlog/{id} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+  }
+}
