@@ -1,0 +1,239 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Only the verified owner Google account can administer the site.
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email == 'gokoivot@gmail.com'
+        && request.auth.token.email_verified == true;
+    }
+
+    // Bangladesh time (UTC+6), matching monthKey() in index-upgraded.html.
+    function monthNow() {
+      let t = request.time + duration.value(6, 'h');
+      return string(t.year()) + '-' + (t.month() < 10 ? '0' : '') + string(t.month());
+    }
+
+    function elapsed(oldTs) {
+      return (request.time.toMillis() - oldTs.toMillis()) / 1000;
+    }
+
+    function isDisabled(uid) {
+      return get(/databases/$(database)/documents/players/$(uid)).data.disabled == true;
+    }
+
+    // Validate player-side counters against elapsed server time.
+    function playerOk() {
+      let n = request.resource.data;
+      let o = resource.data;
+      let dt = elapsed(o.lastSync);
+      return n.diff(o).affectedKeys().hasOnly([
+          'name', 'nameLower', 'lastActive', 'lastSync',
+          'totalSec', 'monthKey', 'monthSec', 'games',
+          'sessions', 'matches', 'wins'
+        ])
+        && n.name is string
+        && n.name.size() >= 1
+        && n.name.size() <= 16
+        && n.nameLower is string
+        && n.nameLower == n.name.lower()
+        && n.lastSync == request.time
+        && n.lastActive == request.time
+        && n.totalSec is number
+        && n.totalSec >= o.totalSec
+        && n.totalSec - o.totalSec <= dt + 5
+        && n.monthSec is number
+        && (n.monthKey == o.monthKey || n.monthKey == monthNow())
+        && (n.monthKey == o.monthKey
+              ? (n.monthSec >= o.monthSec && n.monthSec - o.monthSec <= dt + 5)
+              : n.monthSec <= dt + 5)
+        && n.sessions is number
+        && n.sessions >= o.sessions
+        && n.sessions - o.sessions <= 10
+        && n.wins is number
+        && n.wins >= o.wins
+        && n.wins - o.wins <= 10
+        && n.matches is number
+        && n.matches >= o.matches
+        && n.matches - o.matches <= 10;
+    }
+
+    // Each player can read their own document. Only the owner can list all players.
+    match /players/{uid} {
+      allow get: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow list: if isAdmin();
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasAll([
+          'name', 'nameLower', 'createdAt', 'lastActive', 'lastSync',
+          'totalSec', 'monthKey', 'monthSec', 'games',
+          'sessions', 'matches', 'wins', 'disabled'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'name', 'nameLower', 'createdAt', 'lastActive', 'lastSync',
+          'totalSec', 'monthKey', 'monthSec', 'games',
+          'sessions', 'matches', 'wins', 'disabled'
+        ])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 16
+        && request.resource.data.nameLower == request.resource.data.name.lower()
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.lastActive == request.time
+        && request.resource.data.lastSync == request.time
+        && request.resource.data.totalSec == 0
+        && request.resource.data.monthSec == 0
+        && request.resource.data.sessions == 0
+        && request.resource.data.matches == 0
+        && request.resource.data.wins == 0
+        && request.resource.data.monthKey == monthNow()
+        && request.resource.data.disabled == false;
+
+      allow update: if (
+          isAdmin()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'disabled', 'name', 'nameLower', 'kick'
+          ])
+        )
+        || (
+          signedIn()
+          && request.auth.uid == uid
+          && resource.data.disabled == false
+          && playerOk()
+        );
+
+      allow delete: if false;
+    }
+
+    // Public leaderboard documents are mirrors of the validated player document.
+    // This avoids a separate timer limit from blocking the Player of the Month record.
+    function validMonthMirror(uid, monthId) {
+      let p = get(/databases/$(database)/documents/players/$(uid)).data;
+      return request.resource.data.keys().hasAll(['name', 'sec', 'updated'])
+        && request.resource.data.keys().hasOnly(['name', 'sec', 'updated'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 16
+        && request.resource.data.name == p.name
+        && request.resource.data.sec is number
+        && request.resource.data.sec >= 0
+        && request.resource.data.sec == p.monthSec
+        && p.monthKey == monthId
+        && p.disabled == false
+        && request.resource.data.updated == request.time;
+    }
+
+
+    // Public lifetime-best leaderboard mirror. Each player can publish only
+    // their own current name and lifetime total, matching their validated profile.
+    match /months/lifetime/players/{uid} {
+      allow get: if true;
+      allow list: if request.query.limit != null && request.query.limit <= 1;
+      allow create, update: if signedIn()
+        && (isAdmin() || request.auth.uid == uid)
+        && request.resource.data.keys().hasAll(['name', 'sec', 'updated'])
+        && request.resource.data.keys().hasOnly(['name', 'sec', 'updated'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 1
+        && request.resource.data.name.size() <= 16
+        && request.resource.data.name == get(/databases/$(database)/documents/players/$(uid)).data.name
+        && request.resource.data.sec is number
+        && request.resource.data.sec >= 0
+        && request.resource.data.sec == get(/databases/$(database)/documents/players/$(uid)).data.totalSec
+        && get(/databases/$(database)/documents/players/$(uid)).data.disabled == false
+        && request.resource.data.updated == request.time;
+      allow delete: if isAdmin();
+    }
+
+    match /months/{m}/players/{uid} {
+      allow get: if isAdmin() || (signedIn() && request.auth.uid == uid);
+      // Public site only queries the top 1 player.
+      allow list: if isAdmin() || (signedIn() && request.query.limit <= 1);
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && m == monthNow()
+        && validMonthMirror(uid, m);
+
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && m == monthNow()
+        && validMonthMirror(uid, m);
+
+      allow delete: if false;
+    }
+
+    // Public site settings; only the verified owner can write.
+    match /config/public {
+      allow read: if true;
+      allow write: if isAdmin()
+        && request.resource.data.keys().hasOnly([
+          'master', 'games', 'visitMode', 'visitValue',
+          'potmOverride', 'motm', 'banner'
+        ]);
+    }
+
+    // Visitor counter. A visitor can add one count only when their visitor
+    // timestamp is also created/updated in the same atomic batch.
+    match /stats/global {
+      allow read: if isAdmin();
+
+      allow create: if isAdmin()
+        || (
+          signedIn()
+          && request.resource.data.keys().hasOnly(['visits'])
+          && request.resource.data.visits == 1
+          && getAfter(/databases/$(database)/documents/visitors/$(request.auth.uid)).data.last == request.time
+        );
+
+      allow update: if isAdmin()
+        || (
+          signedIn()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['visits'])
+          && request.resource.data.visits == resource.data.visits + 1
+          && getAfter(/databases/$(database)/documents/visitors/$(request.auth.uid)).data.last == request.time
+        );
+
+      allow delete: if false;
+    }
+
+    match /visitors/{uid} {
+      allow read: if isAdmin();
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['last'])
+        && request.resource.data.last == request.time;
+
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['last'])
+        && request.resource.data.last == request.time
+        && request.time > resource.data.last + duration.value(6, 'h');
+
+      allow delete: if false;
+    }
+
+    // Owner-only activity log.
+    match /adminlog/{id} {
+      allow read: if isAdmin();
+
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['action', 'detail', 't', 'by'])
+        && request.resource.data.action is string
+        && request.resource.data.action.size() <= 100
+        && request.resource.data.detail is string
+        && request.resource.data.detail.size() <= 500
+        && request.resource.data.by == 'gokoivot@gmail.com'
+        && request.resource.data.t == request.time;
+
+      allow update, delete: if false;
+    }
+  }
+}
